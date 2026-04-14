@@ -17,3 +17,4 @@ session.db-wal
 *.swp
 *.DS_Store
 .vscode/
+azure_key.pem

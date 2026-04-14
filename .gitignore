@@ -1,0 +1,19 @@
+# Whatsmeow session database
+session.db
+session.db-shm
+session.db-wal
+
+# Go build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Editor / temporary files
+*.log
+*.tmp
+*.swp
+*.DS_Store
+.vscode/

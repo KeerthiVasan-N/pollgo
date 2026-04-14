@@ -29,6 +29,28 @@ var (
 	voteOptionMu    sync.Mutex
 )
 
+func extractText(msg *waE2E.Message) string {
+	if msg.GetConversation() != "" {
+		return msg.GetConversation()
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return ext.GetText()
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	if buttons := msg.GetButtonsResponseMessage(); buttons != nil {
+		return buttons.GetSelectedDisplayText()
+	}
+	return ""
+}
+
 func main() {
 	// Initialize context for library calls
 	ctx := context.Background()
@@ -59,7 +81,7 @@ func main() {
 
 			// Handle vote-N and votefor-text commands from self
 			if v.Info.IsFromMe {
-				text := strings.TrimSpace(msg.GetConversation())
+				text := strings.TrimSpace(extractText(msg))
 				lowerText := strings.ToLower(text)
 				if strings.HasPrefix(lowerText, "vote-") {
 					numStr := strings.TrimPrefix(lowerText, "vote-")

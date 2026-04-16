@@ -58,7 +58,7 @@ func main() {
 	// Initialize database for session storage
 	// We pass ctx as the first argument as required by the latest API
 	log.Println("Initializing database for session storage...")
-	container, err := sqlstore.New(ctx, "sqlite", "file:session.db?_pragma=foreign_keys(1)", nil)
+	container, err := sqlstore.New(ctx, "sqlite", "file:session.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)", nil)
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}

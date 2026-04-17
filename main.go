@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/mdp/qrterminal/v3"
+	"go.mau.fi/libsignal/session"
 	"go.mau.fi/whatsmeow"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	whatsmeowStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -28,6 +30,86 @@ var (
 	voteSearchQuery string
 	voteOptionMu    sync.Mutex
 )
+
+// prefetchAndEstablishSessions fetches prekey bundles AND processes them
+// into real Signal sessions so that SendMessage finds warm sessions.
+// Only establishes sessions for devices that don't already have one.
+func prefetchAndEstablishSessions(client *whatsmeow.Client, ctx context.Context, deviceJIDs []types.JID) (established int) {
+	if len(deviceJIDs) == 0 {
+		return 0
+	}
+
+	// Filter out devices that already have a session — don't overwrite them
+	var needSession []types.JID
+	for _, jid := range deviceJIDs {
+		hasSession, err := client.Store.ContainsSession(ctx, jid.SignalAddress())
+		if err != nil {
+			log.Printf("[PREFETCH] Session check error for %s: %v\n", jid, err)
+			continue
+		}
+		if !hasSession {
+			needSession = append(needSession, jid)
+		}
+	}
+
+	if len(needSession) == 0 {
+		log.Printf("[PREFETCH] All %d devices already have sessions, skipping\n", len(deviceJIDs))
+		return 0
+	}
+	log.Printf("[PREFETCH] %d/%d devices need sessions, fetching prekeys...\n", len(needSession), len(deviceJIDs))
+
+	bundles := client.DangerousInternals().FetchPreKeysNoError(ctx, needSession)
+	serializer := whatsmeowStore.SignalProtobufSerializer
+	for jid, bundle := range bundles {
+		if bundle == nil {
+			continue
+		}
+		builder := session.NewBuilderFromSignal(client.Store, jid.SignalAddress(), serializer)
+		if err := builder.ProcessBundle(ctx, bundle); err != nil {
+			log.Printf("[PREFETCH] Session error for %s: %v\n", jid, err)
+			continue
+		}
+		established++
+	}
+	return established
+}
+
+// prefetchTargetGroup warms Signal sessions for the target group
+const targetGroupName = "EXTERRO INDIA"
+
+func prefetchTargetGroup(client *whatsmeow.Client, ctx context.Context) {
+	groups, err := client.GetJoinedGroups(ctx)
+	if err != nil {
+		log.Printf("[PREFETCH] Failed to get joined groups: %v\n", err)
+		return
+	}
+
+	var target *types.GroupInfo
+	for _, g := range groups {
+		if strings.EqualFold(g.Name, targetGroupName) {
+			target = g
+			break
+		}
+	}
+	if target == nil {
+		log.Printf("[PREFETCH] Group '%s' not found\n", targetGroupName)
+		return
+	}
+
+	var memberJIDs []types.JID
+	for _, p := range target.Participants {
+		memberJIDs = append(memberJIDs, p.JID)
+	}
+	deviceJIDs, err := client.GetUserDevices(ctx, memberJIDs)
+	if err != nil {
+		log.Printf("[PREFETCH] Failed to get devices for '%s': %v\n", target.Name, err)
+		return
+	}
+	start := time.Now()
+	established := prefetchAndEstablishSessions(client, ctx, deviceJIDs)
+	log.Printf("[PREFETCH] Group '%s': established %d sessions (%d members, %d devices) in %v\n",
+		target.Name, established, len(target.Participants), len(deviceJIDs), time.Since(start))
+}
 
 func extractText(msg *waE2E.Message) string {
 	if msg.GetConversation() != "" {
@@ -76,6 +158,21 @@ func main() {
 	log.Println("Adding event handler...")
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
+		case *events.Connected:
+			_ = v // suppress unused
+			log.Println("[CONNECTED] Client connected, starting background prefetch for EXTERRO INDIA...")
+			go func() {
+				time.Sleep(2 * time.Second)
+				prefetchTargetGroup(client, ctx)
+
+				// Re-warm every 10 minutes to catch new members/devices
+				ticker := time.NewTicker(10 * time.Minute)
+				defer ticker.Stop()
+				for range ticker.C {
+					log.Println("[PREFETCH] Periodic re-warm starting...")
+					prefetchTargetGroup(client, ctx)
+				}
+			}()
 		case *events.Message:
 			msg := v.Message
 
@@ -159,17 +256,13 @@ func main() {
 							log.Printf("[PREFETCH] Failed to get user devices: %v\n", err)
 							return
 						}
-						log.Printf("[PREFETCH] Found %d devices, fetching prekeys...\n", len(deviceJIDs))
+						log.Printf("[PREFETCH] Found %d devices, establishing sessions...\n", len(deviceJIDs))
 
-						// Fetch prekeys (no message sent)
-						bundles := client.DangerousInternals().FetchPreKeysNoError(ctx, deviceJIDs)
-						fetched := 0
-						for _, b := range bundles {
-							if b != nil {
-								fetched++
-							}
-						}
-						log.Printf("[PREFETCH] Done! Got prekeys for %d/%d devices in group '%s'\n", fetched, len(deviceJIDs), name)
+						// Fetch prekeys AND establish Signal sessions
+						start := time.Now()
+						established := prefetchAndEstablishSessions(client, ctx, deviceJIDs)
+						log.Printf("[PREFETCH] Done! Established %d sessions for %d devices in group '%s' (%v)\n",
+							established, len(deviceJIDs), name, time.Since(start))
 					}(groupName)
 					return
 				}
@@ -225,6 +318,7 @@ func main() {
 
 				if len(pollOptions) > 0 {
 					go func(info events.Message, optName string, optNum int) {
+						start := time.Now()
 						log.Printf("Auto-voting for option %d: %s\n", optNum, optName)
 
 						// Workaround: EncryptPollVote uses getOwnID() (phone number JID)
@@ -274,11 +368,13 @@ func main() {
 							},
 						}
 
+						sendStart := time.Now()
 						resp, err := client.SendMessage(ctx, info.Info.Chat, pollUpdateMsg)
 						if err != nil {
 							log.Printf("Failed to send poll vote: %v\n", err)
 						} else {
-							log.Printf("Successfully voted for option %d! Response: ID=%s, Timestamp=%v\n", optNum, resp.ID, resp.Timestamp)
+							log.Printf("Successfully voted for option %d in %v (total %v)! Response: ID=%s, Timestamp=%v\n",
+								optNum, time.Since(sendStart), time.Since(start), resp.ID, resp.Timestamp)
 						}
 					}(*v, pollOptions[selectedIdx].GetOptionName(), selectedIdx+1)
 				}

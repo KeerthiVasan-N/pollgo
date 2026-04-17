@@ -1,0 +1,77 @@
+diff --git a/vendor/go.mau.fi/whatsmeow/send.go b/vendor/go.mau.fi/whatsmeow/send.go
+index 3954e15..2d6c80c 100644
+--- a/vendor/go.mau.fi/whatsmeow/send.go
++++ b/vendor/go.mau.fi/whatsmeow/send.go
+@@ -18,6 +18,7 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/rs/zerolog"
+@@ -1296,30 +1297,47 @@ func (cli *Client) encryptMessageForDevices(
+ 	}
+ 	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
+ 
++	var encMu sync.Mutex
++	var encWg sync.WaitGroup
++	var encCtxErr error
++
+ 	for _, jid := range allDevices {
+-		plaintext := msgPlaintext
++		ptxt := msgPlaintext
+ 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
+ 			if jid == ownJID || jid == ownLID {
+ 				continue
+ 			}
+-			plaintext = dsmPlaintext
++			ptxt = dsmPlaintext
+ 		}
+-		encrypted, isPreKey, err := cli.encryptMessageForDeviceAndWrap(
+-			ctx, plaintext, jid, encryptionIdentities[jid], bundles[jid], encAttrs, existingSessions,
+-		)
+-		if err != nil {
+-			// TODO return these errors if it's a fatal one (like context cancellation or database)
+-			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
+-			if ctx.Err() != nil {
+-				return nil, false, err
++		encWg.Add(1)
++		go func(jid types.JID, ptxt []byte) {
++			defer encWg.Done()
++			encrypted, isPreKey, encErr := cli.encryptMessageForDeviceAndWrap(
++				ctx, ptxt, jid, encryptionIdentities[jid], bundles[jid], encAttrs, existingSessions,
++			)
++			if encErr != nil {
++				// TODO return these errors if it's a fatal one (like context cancellation or database)
++				cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, encErr)
++				if ctx.Err() != nil {
++					encMu.Lock()
++					if encCtxErr == nil {
++						encCtxErr = encErr
++					}
++					encMu.Unlock()
++				}
++				return
+ 			}
+-			continue
+-		}
+-
+-		participantNodes = append(participantNodes, *encrypted)
+-		if isPreKey {
+-			includeIdentity = true
+-		}
++			encMu.Lock()
++			participantNodes = append(participantNodes, *encrypted)
++			if isPreKey {
++				includeIdentity = true
++			}
++			encMu.Unlock()
++		}(jid, ptxt)
++	}
++	encWg.Wait()
++	if encCtxErr != nil {
++		return nil, false, encCtxErr
+ 	}
+ 	err = cli.Store.PutCachedSessions(ctx)
+ 	if err != nil {

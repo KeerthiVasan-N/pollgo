@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -1297,10 +1298,12 @@ func (cli *Client) encryptMessageForDevices(
 	}
 	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
 
-	var encMu sync.Mutex
-	var encWg sync.WaitGroup
-	var encCtxErr error
+	type encWork struct {
+		jid  types.JID
+		ptxt []byte
+	}
 
+	workCh := make(chan encWork, len(allDevices))
 	for _, jid := range allDevices {
 		ptxt := msgPlaintext
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
@@ -1309,31 +1312,46 @@ func (cli *Client) encryptMessageForDevices(
 			}
 			ptxt = dsmPlaintext
 		}
+		workCh <- encWork{jid: jid, ptxt: ptxt}
+	}
+	close(workCh)
+
+	var encMu sync.Mutex
+	var encWg sync.WaitGroup
+	var encCtxErr error
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(allDevices) {
+		numWorkers = len(allDevices)
+	}
+	for i := 0; i < numWorkers; i++ {
 		encWg.Add(1)
-		go func(jid types.JID, ptxt []byte) {
+		go func() {
 			defer encWg.Done()
-			encrypted, isPreKey, encErr := cli.encryptMessageForDeviceAndWrap(
-				ctx, ptxt, jid, encryptionIdentities[jid], bundles[jid], encAttrs, existingSessions,
-			)
-			if encErr != nil {
-				// TODO return these errors if it's a fatal one (like context cancellation or database)
-				cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, encErr)
-				if ctx.Err() != nil {
-					encMu.Lock()
-					if encCtxErr == nil {
-						encCtxErr = encErr
+			for work := range workCh {
+				encrypted, isPreKey, encErr := cli.encryptMessageForDeviceAndWrap(
+					ctx, work.ptxt, work.jid, encryptionIdentities[work.jid], bundles[work.jid], encAttrs, existingSessions,
+				)
+				if encErr != nil {
+					// TODO return these errors if it's a fatal one (like context cancellation or database)
+					cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, work.jid, encErr)
+					if ctx.Err() != nil {
+						encMu.Lock()
+						if encCtxErr == nil {
+							encCtxErr = encErr
+						}
+						encMu.Unlock()
 					}
-					encMu.Unlock()
+					continue
 				}
-				return
+				encMu.Lock()
+				participantNodes = append(participantNodes, *encrypted)
+				if isPreKey {
+					includeIdentity = true
+				}
+				encMu.Unlock()
 			}
-			encMu.Lock()
-			participantNodes = append(participantNodes, *encrypted)
-			if isPreKey {
-				includeIdentity = true
-			}
-			encMu.Unlock()
-		}(jid, ptxt)
+		}()
 	}
 	encWg.Wait()
 	if encCtxErr != nil {

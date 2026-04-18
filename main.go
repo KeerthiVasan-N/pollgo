@@ -31,6 +31,34 @@ var (
 	voteOptionMu    sync.Mutex
 )
 
+type voteTimingStats struct {
+	groupName     string
+	memberCount   int
+	deviceCount   int
+	groupLookup   time.Duration
+	deviceResolve time.Duration
+}
+
+// app-level group name/member cache populated by GetJoinedGroups so the
+// diagnostic goroutine never needs a network call.
+type cachedGroupMeta struct {
+	name        string
+	memberCount int
+}
+
+var (
+	groupMetaCache   = map[types.JID]cachedGroupMeta{}
+	groupMetaCacheMu sync.RWMutex
+)
+
+func updateGroupMetaCache(groups []*types.GroupInfo) {
+	groupMetaCacheMu.Lock()
+	defer groupMetaCacheMu.Unlock()
+	for _, g := range groups {
+		groupMetaCache[g.JID] = cachedGroupMeta{name: g.Name, memberCount: len(g.Participants)}
+	}
+}
+
 // prefetchAndEstablishSessions fetches prekey bundles AND processes them
 // into real Signal sessions so that SendMessage finds warm sessions.
 // Only establishes sessions for devices that don't already have one.
@@ -83,6 +111,7 @@ func prefetchTargetGroup(client *whatsmeow.Client, ctx context.Context) {
 		log.Printf("[PREFETCH] Failed to get joined groups: %v\n", err)
 		return
 	}
+	updateGroupMetaCache(groups)
 
 	var target *types.GroupInfo
 	for _, g := range groups {
@@ -131,6 +160,45 @@ func extractText(msg *waE2E.Message) string {
 		return buttons.GetSelectedDisplayText()
 	}
 	return ""
+}
+
+func collectVoteTimingStats(client *whatsmeow.Client, ctx context.Context, chat types.JID) voteTimingStats {
+	stats := voteTimingStats{}
+	if chat.Server != types.GroupServer {
+		return stats
+	}
+
+	// Read name and member count from the app-level cache (populated by GetJoinedGroups).
+	// This avoids a ~360ms network call to GetGroupInfo.
+	groupStart := time.Now()
+	groupMetaCacheMu.RLock()
+	meta, ok := groupMetaCache[chat]
+	groupMetaCacheMu.RUnlock()
+	stats.groupLookup = time.Since(groupStart)
+
+	if ok {
+		stats.groupName = meta.name
+		stats.memberCount = meta.memberCount
+	} else {
+		log.Printf("[VOTE_TIMING] group %s not in local cache (prefetch not yet run?)\n", chat)
+	}
+
+	// GetUserDevices uses WhatsMeow's in-memory device cache — should be ~0ms when warm.
+	groupInfoFull, err := client.GetGroupInfo(ctx, chat)
+	if err == nil {
+		memberJIDs := make([]types.JID, 0, len(groupInfoFull.Participants))
+		for _, p := range groupInfoFull.Participants {
+			memberJIDs = append(memberJIDs, p.JID)
+		}
+		deviceStart := time.Now()
+		deviceJIDs, devErr := client.GetUserDevices(ctx, memberJIDs)
+		stats.deviceResolve = time.Since(deviceStart)
+		if devErr == nil {
+			stats.deviceCount = len(deviceJIDs)
+		}
+	}
+
+	return stats
 }
 
 func main() {
@@ -324,10 +392,12 @@ func main() {
 						// Workaround: EncryptPollVote uses getOwnID() (phone number JID)
 						// but should use getOwnLID() (LID) for proper encryption.
 						// We manually encrypt with the correct LID using DangerousInternals.
+						marshalStart := time.Now()
 						voteMsg := &waE2E.PollVoteMessage{
 							SelectedOptions: whatsmeow.HashPollOptions([]string{optName}),
 						}
 						plaintext, err := proto.Marshal(voteMsg)
+						marshalDuration := time.Since(marshalStart)
 						if err != nil {
 							log.Printf("Failed to marshal poll vote: %v\n", err)
 							return
@@ -337,11 +407,13 @@ func main() {
 						ownLID := internals.GetOwnLID()
 						log.Printf("Using LID for vote encryption: %s\n", ownLID)
 
+						encryptStart := time.Now()
 						ciphertext, iv, err := internals.EncryptMsgSecret(
 							ctx, ownLID,
 							info.Info.Chat, info.Info.Sender, info.Info.ID,
 							whatsmeow.EncSecretPollVote, plaintext,
 						)
+						encryptDuration := time.Since(encryptStart)
 						if err != nil {
 							log.Printf("Failed to encrypt poll vote: %v\n", err)
 							return
@@ -370,11 +442,27 @@ func main() {
 
 						sendStart := time.Now()
 						resp, err := client.SendMessage(ctx, info.Info.Chat, pollUpdateMsg)
+						sendDuration := time.Since(sendStart)
+						totalDuration := time.Since(start)
 						if err != nil {
 							log.Printf("Failed to send poll vote: %v\n", err)
 						} else {
 							log.Printf("Successfully voted for option %d in %v (total %v)! Response: ID=%s, Timestamp=%v\n",
-								optNum, time.Since(sendStart), time.Since(start), resp.ID, resp.Timestamp)
+								optNum, sendDuration, totalDuration, resp.ID, resp.Timestamp)
+							go func(chat types.JID, marshalDuration, encryptDuration, sendDuration, totalDuration time.Duration) {
+								stats := collectVoteTimingStats(client, ctx, chat)
+								log.Printf("[VOTE_TIMING] group=%q members=%d devices=%d group_lookup=%v device_resolve=%v marshal=%v secret_encrypt=%v send_path=%v total=%v\n",
+									stats.groupName,
+									stats.memberCount,
+									stats.deviceCount,
+									stats.groupLookup,
+									stats.deviceResolve,
+									marshalDuration,
+									encryptDuration,
+									sendDuration,
+									totalDuration,
+								)
+							}(info.Info.Chat, marshalDuration, encryptDuration, sendDuration, totalDuration)
 						}
 					}(*v, pollOptions[selectedIdx].GetOptionName(), selectedIdx+1)
 				}

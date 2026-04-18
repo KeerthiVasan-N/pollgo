@@ -440,36 +440,34 @@ func main() {
 							},
 						}
 
-						sendStart := time.Now()
 						resp, err := client.SendMessage(ctx, info.Info.Chat, pollUpdateMsg,
 							whatsmeow.SendRequestExtra{})
-						sendDuration := time.Since(sendStart)
 						totalDuration := time.Since(start)
 
 						if err != nil {
 							log.Printf("Failed to send poll vote: %v\n", err)
 						} else {
 							dt := resp.DebugTimings
-							log.Printf("Successfully voted for option %d in %v (total %v)! Response: ID=%s, Timestamp=%v\n",
-								optNum, sendDuration, totalDuration, resp.ID, resp.Timestamp)
-							log.Printf("[VOTE_SENT] sent=%v + ack=%v = total %v\n",
-								dt.Send.Round(time.Millisecond),
-								dt.Resp.Round(time.Millisecond),
-								(dt.Send + dt.Resp).Round(time.Millisecond))
-							go func(chat types.JID, marshalDuration, encryptDuration, sendDuration, totalDuration time.Duration) {
+							log.Printf("Successfully voted for option %d! Response: ID=%s, Timestamp=%v\n",
+								optNum, resp.ID, resp.Timestamp)
+							log.Printf("[VOTE_SENT] sent=%.2fms + ack=%.2fms = total %.2fms\n",
+								float64(dt.Send)/float64(time.Millisecond),
+								float64(dt.Resp)/float64(time.Millisecond),
+								float64(dt.Send+dt.Resp)/float64(time.Millisecond))
+							go func(chat types.JID, marshalDuration, encryptDuration, sendTime, ackTime, totalDuration time.Duration) {
 								stats := collectVoteTimingStats(client, ctx, chat)
-								log.Printf("[VOTE_TIMING] group=%q members=%d devices=%d group_lookup=%v device_resolve=%v marshal=%v secret_encrypt=%v send_path=%v total=%v\n",
+								log.Printf("[VOTE_TIMING] group=%q members=%d devices=%d marshal=%.2fms secret_encrypt=%.2fms sent=%.2fms ack=%.2fms send_path=%.2fms total=%.2fms\n",
 									stats.groupName,
 									stats.memberCount,
 									stats.deviceCount,
-									stats.groupLookup,
-									stats.deviceResolve,
-									marshalDuration,
-									encryptDuration,
-									sendDuration,
-									totalDuration,
+									float64(marshalDuration)/float64(time.Millisecond),
+									float64(encryptDuration)/float64(time.Millisecond),
+									float64(sendTime)/float64(time.Millisecond),
+									float64(ackTime)/float64(time.Millisecond),
+									float64(sendTime+ackTime)/float64(time.Millisecond),
+									float64(totalDuration)/float64(time.Millisecond),
 								)
-							}(info.Info.Chat, marshalDuration, encryptDuration, sendDuration, totalDuration)
+							}(info.Info.Chat, marshalDuration, encryptDuration, dt.Send, dt.Resp, totalDuration)
 						}
 					}(*v, pollOptions[selectedIdx].GetOptionName(), selectedIdx+1)
 				}

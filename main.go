@@ -44,6 +44,7 @@ type voteTimingStats struct {
 type cachedGroupMeta struct {
 	name        string
 	memberCount int
+	memberJIDs  []types.JID
 }
 
 var (
@@ -55,7 +56,11 @@ func updateGroupMetaCache(groups []*types.GroupInfo) {
 	groupMetaCacheMu.Lock()
 	defer groupMetaCacheMu.Unlock()
 	for _, g := range groups {
-		groupMetaCache[g.JID] = cachedGroupMeta{name: g.Name, memberCount: len(g.Participants)}
+		memberJIDs := make([]types.JID, 0, len(g.Participants))
+		for _, p := range g.Participants {
+			memberJIDs = append(memberJIDs, p.JID)
+		}
+		groupMetaCache[g.JID] = cachedGroupMeta{name: g.Name, memberCount: len(g.Participants), memberJIDs: memberJIDs}
 	}
 }
 
@@ -183,15 +188,10 @@ func collectVoteTimingStats(client *whatsmeow.Client, ctx context.Context, chat 
 		log.Printf("[VOTE_TIMING] group %s not in local cache (prefetch not yet run?)\n", chat)
 	}
 
-	// GetUserDevices uses WhatsMeow's in-memory device cache — should be ~0ms when warm.
-	groupInfoFull, err := client.GetGroupInfo(ctx, chat)
-	if err == nil {
-		memberJIDs := make([]types.JID, 0, len(groupInfoFull.Participants))
-		for _, p := range groupInfoFull.Participants {
-			memberJIDs = append(memberJIDs, p.JID)
-		}
+	// GetUserDevices uses WhatsMeow's in-memory device cache — no network call needed when warm.
+	if ok && len(meta.memberJIDs) > 0 {
 		deviceStart := time.Now()
-		deviceJIDs, devErr := client.GetUserDevices(ctx, memberJIDs)
+		deviceJIDs, devErr := client.GetUserDevices(ctx, meta.memberJIDs)
 		stats.deviceResolve = time.Since(deviceStart)
 		if devErr == nil {
 			stats.deviceCount = len(deviceJIDs)
@@ -441,14 +441,21 @@ func main() {
 						}
 
 						sendStart := time.Now()
-						resp, err := client.SendMessage(ctx, info.Info.Chat, pollUpdateMsg)
+						resp, err := client.SendMessage(ctx, info.Info.Chat, pollUpdateMsg,
+							whatsmeow.SendRequestExtra{})
 						sendDuration := time.Since(sendStart)
 						totalDuration := time.Since(start)
+
 						if err != nil {
 							log.Printf("Failed to send poll vote: %v\n", err)
 						} else {
+							dt := resp.DebugTimings
 							log.Printf("Successfully voted for option %d in %v (total %v)! Response: ID=%s, Timestamp=%v\n",
 								optNum, sendDuration, totalDuration, resp.ID, resp.Timestamp)
+							log.Printf("[VOTE_SENT] sent=%v + ack=%v = total %v\n",
+								dt.Send.Round(time.Millisecond),
+								dt.Resp.Round(time.Millisecond),
+								(dt.Send + dt.Resp).Round(time.Millisecond))
 							go func(chat types.JID, marshalDuration, encryptDuration, sendDuration, totalDuration time.Duration) {
 								stats := collectVoteTimingStats(client, ctx, chat)
 								log.Printf("[VOTE_TIMING] group=%q members=%d devices=%d group_lookup=%v device_resolve=%v marshal=%v secret_encrypt=%v send_path=%v total=%v\n",

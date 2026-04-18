@@ -282,9 +282,16 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			}
 
 			var participantNodes []waBinary.Node
-			participantNodes, _, err = cli.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, resp.ID, messagePlaintext, nil, waBinary.Attrs{})
+			var inlineBotFlush func() error
+			participantNodes, _, inlineBotFlush, err = cli.encryptMessageForDevices(ctx, []types.JID{req.InlineBotJID}, resp.ID, messagePlaintext, nil, waBinary.Attrs{})
 			if err != nil {
 				return
+			}
+			if inlineBotFlush != nil {
+				if flushErr := inlineBotFlush(); flushErr != nil {
+					err = fmt.Errorf("failed to save cached sessions: %w", flushErr)
+					return
+				}
 			}
 			extraParams.botNode = &waBinary.Node{
 				Tag:     "bot",
@@ -789,7 +796,7 @@ func (cli *Client) sendGroup(
 	ciphertext := encrypted.SignedSerialize()
 	timings.GroupEncrypt = time.Since(start)
 
-	node, allDevices, err := cli.prepareMessageNode(
+	node, allDevices, flush, err := cli.prepareMessageNode(
 		ctx, to, id, message, participants, skdPlaintext, nil, timings, extraParams,
 	)
 	if err != nil {
@@ -811,9 +818,17 @@ func (cli *Client) sendGroup(
 		node.Content = append(node.GetChildren(), cli.getMessageReportingToken(plaintext, message, ownID, to, id))
 	}
 
+	// Pipeline: flush session cache to SQLite concurrently with the network write.
+	flushErrCh := make(chan error, 1)
+	go func() { flushErrCh <- flush() }()
+
 	start = time.Now()
 	data, err := cli.sendNodeAndGetData(ctx, *node)
 	timings.Send = time.Since(start)
+
+	if flushErr := <-flushErrCh; flushErr != nil {
+		return "", nil, fmt.Errorf("failed to save cached sessions: %w", flushErr)
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to send message node: %w", err)
 	}
@@ -856,7 +871,7 @@ func (cli *Client) sendDM(
 		return "", nil, err
 	}
 
-	node, allDevices, err := cli.prepareMessageNode(
+	node, allDevices, flush, err := cli.prepareMessageNode(
 		ctx, to, id, message, []types.JID{to, ownID.ToNonAD()},
 		messagePlaintext, deviceSentMessagePlaintext, timings, extraParams,
 	)
@@ -878,9 +893,17 @@ func (cli *Client) sendDM(
 		})
 	}
 
+	// Pipeline: flush session cache to SQLite concurrently with the network write.
+	flushErrCh := make(chan error, 1)
+	go func() { flushErrCh <- flush() }()
+
 	start = time.Now()
 	data, err := cli.sendNodeAndGetData(ctx, *node)
 	timings.Send = time.Since(start)
+
+	if flushErr := <-flushErrCh; flushErr != nil {
+		return "", nil, fmt.Errorf("failed to save cached sessions: %w", flushErr)
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to send message node: %w", err)
 	}
@@ -1149,12 +1172,12 @@ func (cli *Client) prepareMessageNode(
 	plaintext, dsmPlaintext []byte,
 	timings *MessageDebugTimings,
 	extraParams nodeExtraParams,
-) (*waBinary.Node, []types.JID, error) {
+) (*waBinary.Node, []types.JID, func() error, error) {
 	start := time.Now()
 	allDevices, err := cli.GetUserDevices(ctx, participants)
 	timings.GetDevices = time.Since(start)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get device list: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to get device list: %w", err)
 	}
 
 	if to.Server == types.GroupServer {
@@ -1187,12 +1210,12 @@ func (cli *Client) prepareMessageNode(
 	}
 
 	start = time.Now()
-	participantNodes, includeIdentity, err := cli.encryptMessageForDevices(
+	participantNodes, includeIdentity, flush, err := cli.encryptMessageForDevices(
 		ctx, allDevices, id, plaintext, dsmPlaintext, encAttrs,
 	)
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	participantNode := waBinary.Node{
 		Tag:     "participants",
@@ -1204,7 +1227,7 @@ func (cli *Client) prepareMessageNode(
 		Content: cli.getMessageContent(
 			participantNode, message, attrs, includeIdentity, extraParams,
 		),
-	}, allDevices, nil
+	}, allDevices, flush, nil
 }
 
 func marshalMessage(to types.JID, message *waE2E.Message) (plaintext, dsmPlaintext []byte, err error) {
@@ -1251,7 +1274,7 @@ func (cli *Client) encryptMessageForDevices(
 	id string,
 	msgPlaintext, dsmPlaintext []byte,
 	encAttrs waBinary.Attrs,
-) ([]waBinary.Node, bool, error) {
+) ([]waBinary.Node, bool, func() error, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
 	includeIdentity := false
@@ -1265,7 +1288,7 @@ func (cli *Client) encryptMessageForDevices(
 	}
 	lidMappings, err := cli.Store.LIDs.GetManyLIDsForPNs(ctx, pnDevices)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to fetch LID mappings: %w", err)
+		return nil, false, nil, fmt.Errorf("failed to fetch LID mappings: %w", err)
 	}
 
 	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
@@ -1288,7 +1311,7 @@ func (cli *Client) encryptMessageForDevices(
 
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
+		return nil, false, nil, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
 	var retryDevices []types.JID
 	for addr, exists := range existingSessions {
@@ -1355,13 +1378,14 @@ func (cli *Client) encryptMessageForDevices(
 	}
 	encWg.Wait()
 	if encCtxErr != nil {
-		return nil, false, encCtxErr
+		return nil, false, nil, encCtxErr
 	}
-	err = cli.Store.PutCachedSessions(ctx)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
+	// Return a flush func instead of flushing here so the caller can pipeline
+	// it concurrently with the network send.
+	flush := func() error {
+		return cli.Store.PutCachedSessions(ctx)
 	}
-	return participantNodes, includeIdentity, nil
+	return participantNodes, includeIdentity, flush, nil
 }
 
 func (cli *Client) encryptMessageForDeviceAndWrap(

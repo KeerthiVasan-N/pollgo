@@ -128,7 +128,7 @@ func benchmarkEncryptMessageForDevices(b *testing.B, nDevices int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, err := client.DangerousInternals().EncryptMessageForDevices(
+		_, _, _, err := client.DangerousInternals().EncryptMessageForDevices(
 			ctx, remoteJIDs, fmt.Sprintf("BENCH%08d", i), plaintext, nil, encAttrs,
 		)
 		if err != nil {

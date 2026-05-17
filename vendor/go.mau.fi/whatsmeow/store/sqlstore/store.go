@@ -74,9 +74,11 @@ const (
 		INSERT INTO whatsmeow_identity_keys (our_jid, their_id, identity) VALUES ($1, $2, $3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET identity=excluded.identity
 	`
-	deleteAllIdentitiesQuery = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
-	deleteIdentityQuery      = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
-	getIdentityQuery         = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	deleteAllIdentitiesQuery     = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2`
+	deleteIdentityQuery          = `DELETE FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	getIdentityQuery             = `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id=$2`
+	getManyIdentityQueryPostgres = `SELECT their_id, identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id = ANY($2)`
+	getManyIdentityQueryGeneric  = `SELECT their_id, identity FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id IN (%s)`
 )
 
 func (s *SQLStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
@@ -106,6 +108,59 @@ func (s *SQLStore) IsTrustedIdentity(ctx context.Context, address string, key [3
 		return false, ErrInvalidLength
 	}
 	return *(*[32]byte)(existingIdentity) == key, nil
+}
+
+type addressIdentityTuple struct {
+	Address  string
+	Identity []byte
+}
+
+var identityScanner = dbutil.ConvertRowFn[addressIdentityTuple](func(row dbutil.Scannable) (out addressIdentityTuple, err error) {
+	err = row.Scan(&out.Address, &out.Identity)
+	return
+})
+
+func (s *SQLStore) GetManyIdentities(ctx context.Context, addresses []string) (map[string][32]byte, error) {
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+	var rows dbutil.Rows
+	var err error
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		rows, err = s.db.Query(ctx, getManyIdentityQueryPostgres, s.JID, PostgresArrayWrapper(addresses))
+	} else {
+		args := make([]any, len(addresses)+1)
+		placeholders := make([]string, len(addresses))
+		args[0] = s.JID
+		for i, addr := range addresses {
+			args[i+1] = addr
+			placeholders[i] = fmt.Sprintf("$%d", i+2)
+		}
+		rows, err = s.db.Query(ctx, fmt.Sprintf(getManyIdentityQueryGeneric, strings.Join(placeholders, ",")), args...)
+	}
+	result := make(map[string][32]byte, len(addresses))
+	err = identityScanner.NewRowIter(rows, err).Iter(func(t addressIdentityTuple) (bool, error) {
+		if len(t.Identity) != 32 {
+			return false, ErrInvalidLength
+		}
+		result[t.Address] = *(*[32]byte)(t.Identity)
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *SQLStore) PutManyIdentities(ctx context.Context, identities map[string][32]byte) error {
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for addr, key := range identities {
+			if err := s.PutIdentity(ctx, addr, key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 const (

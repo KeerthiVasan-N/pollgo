@@ -1313,6 +1313,10 @@ func (cli *Client) encryptMessageForDevices(
 	if err != nil {
 		return nil, false, nil, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
+	ctx, err = cli.Store.WithCachedIdentities(ctx, sessionAddresses)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("failed to prefetch identities: %w", err)
+	}
 	var retryDevices []types.JID
 	for addr, exists := range existingSessions {
 		if !exists {
@@ -1383,6 +1387,9 @@ func (cli *Client) encryptMessageForDevices(
 	// Return a flush func instead of flushing here so the caller can pipeline
 	// it concurrently with the network send.
 	flush := func() error {
+		if err := cli.Store.PutCachedIdentities(ctx); err != nil {
+			return err
+		}
 		return cli.Store.PutCachedSessions(ctx)
 	}
 	return participantNodes, includeIdentity, flush, nil
